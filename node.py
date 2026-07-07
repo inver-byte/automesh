@@ -34,15 +34,12 @@ from pydantic import BaseModel
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("automesh")
 
-# ---- identity & config (all via env vars so every node runs the same code) ----
+
 NODE_ID = os.environ["NODE_ID"]
 NODE_URL = os.environ["NODE_URL"]
-BOOTSTRAP_URL = os.environ.get("BOOTSTRAP_URL")  # unset => this node IS an entry point
+BOOTSTRAP_URL = os.environ.get("BOOTSTRAP_URL")
 PORT = int(os.environ.get("PORT", "8000"))
 
-# Direct weighted links to neighbors, e.g. LINKS='{"B": 10, "C": 5}'
-# (weight = simulated latency in ms). This is the actual topology —
-# separate from known_peers, which is just "who's out there" for discovery.
 try:
     OWN_LINKS: Dict[str, float] = json.loads(os.environ.get("LINKS", "{}"))
 except json.JSONDecodeError as e:
@@ -54,26 +51,17 @@ DEAD_THRESHOLD = 6.0       # no heartbeat for this long => DEAD
 CHECK_INTERVAL = 1.0       # how often the failure detector sweeps
 LSA_INTERVAL = 3.0         # how often we (re-)flood our link-state advertisement
 
-# ---- in-memory state (per-node, no shared/central store) ----
+
 known_peers: Dict[str, str] = {NODE_ID: NODE_URL}   # node_id -> base url
 last_seen: Dict[str, float] = {NODE_ID: time.time()}
 status: Dict[str, str] = {NODE_ID: "ALIVE"}
 
-# lsa_db[node_id] = {"links": {neighbor_id: weight}, "seq": int}
-# This is every node's view of "what links does X advertise" — merge these
-# together across all nodes and you get the full topology graph.
 lsa_db: Dict[str, Dict] = {NODE_ID: {"links": OWN_LINKS, "seq": 0}}
 
-# routing_table[dest_id] = {"next_hops": [...], "cost": ..., "paths": [[...],...]}
-# next_hops has >1 entry exactly when ECMP applies (multiple paths tie for
-# lowest cost) — that's the "multi-path routing" feature.
 routing_table: Dict[str, Dict] = {}
 last_convergence_ms: Optional[float] = None
 last_convergence_reason: str = "startup"
 
-# link_load[neighbor_id] = a decaying counter of recent traffic sent that way.
-# Used to pick among ECMP candidates by "least loaded" instead of always the
-# same one — this is what makes it load-aware rather than plain round-robin.
 link_load: Dict[str, float] = {}
 LOAD_DECAY = 0.75          # multiply every neighbor's load by this each tick
 LOAD_DECAY_INTERVAL = 2.0  # seconds between decay ticks
@@ -83,11 +71,7 @@ messages_dropped = 0
 drop_reasons: Dict[str, int] = {}  # categorized so this stays diagnosable, not a pile of one-off strings
 convergence_count = 0  # how many times recompute_routes has run, total
 
-# ---- failure injection state ----
-# Simulating "down" via a flag (rather than actually killing the process)
-# means the node keeps its memory and can be revived instantly for repeatable
-# demos/tests, while still behaving exactly like a real outage to everyone
-# else: it stops sending, and stops responding (503) to anything incoming.
+
 SIMULATED_DOWN = False
 last_failure_event: Optional[Dict] = None  # last injected fault, for /debug
 
@@ -128,12 +112,7 @@ def merge_lsa(incoming: Dict[str, Dict]) -> bool:
 
 
 def recompute_routes(reason: str) -> None:
-    """Rebuild the topology graph from lsa_db (skipping anything we currently
-    believe is DEAD) and compute, for every reachable destination, ALL paths
-    tied for lowest cost (not just one) — that's Equal-Cost Multi-Path.
-    This is what makes the network self-healing: call this after any
-    topology change (new LSA) or liveness change (failure detected) and
-    traffic automatically reroutes around the problem."""
+    
     global routing_table, last_convergence_ms, last_convergence_reason, convergence_count
     start = time.perf_counter()
 
@@ -145,12 +124,6 @@ def recompute_routes(reason: str) -> None:
         for neighbor, weight in entry.get("links", {}).items():
             if status.get(neighbor) == "DEAD":
                 continue
-            # A link only exists if BOTH endpoints currently advertise it.
-            # This matters for single-sided failure injection: if C kills
-            # its link to B, B's LSA might still list C for a moment (or
-            # until B independently notices) -- requiring agreement means
-            # C's side alone is enough to pull the edge out immediately,
-            # exactly like a real point-to-point interface going down.
             neighbor_entry = lsa_db.get(neighbor)
             if neighbor_entry and nid in neighbor_entry.get("links", {}):
                 graph.add_edge(nid, neighbor, weight=weight)
@@ -188,9 +161,7 @@ def recompute_routes(reason: str) -> None:
 
 
 def choose_next_hop(dest: str) -> Optional[str]:
-    """Pick which neighbor to forward toward `dest` through. If there's only
-    one shortest-cost option, use it. If multiple tie (ECMP), pick whichever
-    currently has the least recent traffic — load-aware distribution."""
+    
     route = routing_table.get(dest)
     if not route:
         return None
@@ -201,8 +172,7 @@ def choose_next_hop(dest: str) -> Optional[str]:
 
 
 async def load_decay_loop() -> None:
-    """Recent traffic should matter more than traffic from a while ago, so
-    load counters decay geometrically instead of growing forever."""
+  
     while True:
         await asyncio.sleep(LOAD_DECAY_INTERVAL)
         for nid in list(link_load.keys()):
@@ -266,9 +236,7 @@ async def heartbeat_loop() -> None:
 
 
 async def failure_detector_loop() -> None:
-    """Independently sweep last_seen timestamps and flip ALIVE/DEAD.
-    Any change in liveness immediately triggers a routing reconvergence —
-    this is the actual self-healing mechanism."""
+    
     while True:
         await asyncio.sleep(CHECK_INTERVAL)
         now = time.time()
@@ -290,11 +258,7 @@ async def failure_detector_loop() -> None:
 
 
 async def lsa_flood_loop() -> None:
-    """Periodically send our whole lsa_db to our direct link neighbors.
-    Simplified link-state flooding: real OSPF only forwards what changed
-    and uses sequence numbers to prevent loops forever, but for a 5-node
-    demo network, "just resend everything you know periodically" converges
-    fine and is much easier to reason about."""
+   
     async with httpx.AsyncClient(timeout=3.0) as client:
         while True:
             await asyncio.sleep(LSA_INTERVAL)
@@ -358,19 +322,14 @@ async def heartbeat(msg: HeartbeatMsg):
     status[msg.node_id] = "ALIVE"
     merge_peers(msg.known_peers)
     if was_dead:
-        # heartbeat() beats failure_detector_loop to flipping this status,
-        # so if we don't recompute here, the "recovered" branch in the
-        # detector loop never actually fires (status is already ALIVE by
-        # the time it looks) and routes silently never come back.
+       
         recompute_routes(reason=f"heartbeat received from recovered node {msg.node_id}")
     return {"known_peers": known_peers}
 
 
 @app.post("/lsa")
 async def receive_lsa(msg: LSAMsg):
-    """A neighbor is flooding us their view of the topology. Merge it, and
-    if anything changed, recompute our own routes. Return our own view back
-    so the exchange is bidirectional in one round trip."""
+    
     if SIMULATED_DOWN:
         raise HTTPException(status_code=503, detail="node is simulated down")
     if merge_lsa(msg.lsa_db):
@@ -380,10 +339,7 @@ async def receive_lsa(msg: LSAMsg):
 
 @app.post("/message")
 async def receive_message(pkt: MessagePacket):
-    """Real packet forwarding, hop by hop, using our local routing table.
-    This is where ECMP + load-aware distribution actually do something:
-    every hop with multiple equal-cost next-hops picks the least-loaded one
-    independently."""
+    
     global messages_forwarded, messages_delivered, messages_dropped
     if SIMULATED_DOWN:
         raise HTTPException(status_code=503, detail="node is simulated down")
@@ -408,11 +364,7 @@ async def receive_message(pkt: MessagePacket):
     if not next_hop:
         return drop("no_route", "no_route")
 
-    # Try every ECMP candidate in least-loaded order, not just the first
-    # pick -- if a node's failure detector hasn't caught up to a crash yet
-    # (independent clocks across nodes can be a second or so out of sync),
-    # this fails over to a surviving path at forward-time instead of
-    # bubbling up whatever error the dead hop returned.
+    
     candidates = sorted(routing_table[pkt.destination]["next_hops"], key=lambda h: link_load.get(h, 0.0))
     pkt.ttl -= 1
     last_error = "no_route"
@@ -438,10 +390,7 @@ async def receive_message(pkt: MessagePacket):
 
 @app.post("/admin/kill")
 async def admin_kill():
-    """Simulate this node crashing: stop sending AND stop responding to
-    everything, without losing in-memory state, so it can be revived
-    instantly for repeatable demos. From every other node's point of view
-    this is indistinguishable from a real process crash."""
+    
     global SIMULATED_DOWN, last_failure_event
     SIMULATED_DOWN = True
     last_failure_event = {"type": "node_kill", "node": NODE_ID, "at": time.time()}
